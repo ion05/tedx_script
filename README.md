@@ -59,7 +59,7 @@ Results are written to `output/emails.csv` with these columns:
 | semester | Which semester the student appeared in |
 | alias    | Purdue directory alias |
 | email    | alias@purdue.edu |
-| status   | `matched`, `ambiguous`, `matched_fuzzy`, `matched_browser`, `unmatched`, `error_request` |
+| status   | `matched`, `unmatched`, `error_request` |
 
 ## Troubleshooting
 

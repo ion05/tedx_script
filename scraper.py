@@ -239,16 +239,11 @@ def lookup_directory_requests(
         if _name_matches(cn_name, record.first_name, record.last_name):
             matches.append({"alias": alias, "email": email, "cn": cn_name})
 
-    if len(matches) == 1:
+    if len(matches) >= 1:
         m = matches[0]
         record.alias = m["alias"]
         record.email = m["email"] or (f"{m['alias']}@purdue.edu" if m["alias"] else None)
         record.status = "matched"
-    elif len(matches) > 1:
-        m = matches[0]
-        record.alias = m["alias"]
-        record.email = m["email"] or (f"{m['alias']}@purdue.edu" if m["alias"] else None)
-        record.status = "ambiguous"
     else:
         if people:
             first_person = people[0]
@@ -258,7 +253,7 @@ def lookup_directory_requests(
                 if alias_td:
                     record.alias = alias_td.get_text(strip=True)
                     record.email = f"{record.alias}@purdue.edu"
-                    record.status = "matched_fuzzy"
+                    record.status = "matched"
                     return
         record.status = "unmatched"
 
@@ -329,13 +324,13 @@ def lookup_directory_browser(record: StudentRecord) -> None:
                 if alias_td:
                     record.alias = alias_td.get_text(strip=True)
                     record.email = f"{record.alias}@purdue.edu"
-                    record.status = "matched_browser"
+                    record.status = "matched"
                     return
 
-        record.status = "unmatched_browser"
+        record.status = "unmatched"
     except Exception as exc:
         print(f"  [browser] Error for '{record.full_name}': {exc}")
-        record.status = "error_browser"
+        record.status = "error_request"
     finally:
         page.close()
 
