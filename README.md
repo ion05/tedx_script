@@ -11,9 +11,6 @@ source venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
-
-# (Optional) Install Playwright browser for fallback lookups
-playwright install chromium
 ```
 
 ## Usage
@@ -35,9 +32,6 @@ python scraper.py --workers 1 --delay 0.3         # Conservative / sequential
 
 # Limit names per semester (testing)
 python scraper.py --max-names 20
-
-# Skip Playwright fallback
-python scraper.py --no-browser
 ```
 
 ### Semester Codes
@@ -71,4 +65,4 @@ For example: `science_emails_fall_2025.csv`, `science_emails_spring_2023.csv`.
 - **No names found**: Check you have internet access and the semester code is valid.
 - **Many "unmatched"**: Some students may have graduated and been removed from the directory. Try a more recent semester.
 - **Slow**: Increase `--workers` (default 8) and decrease `--delay` (default 0.1s).
-- **Playwright errors**: Run `playwright install chromium` or use `--no-browser` to skip.
+- **CSV not updating**: CSV is saved every 50 lookups automatically. If the script crashes, you'll still have partial results.

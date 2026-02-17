@@ -5,6 +5,7 @@ Purdue Dean's List → Directory Email Scraper
 Fetches student names from the Purdue College of Science honors page,
 looks up each name in the Purdue Directory to find their alias,
 and writes name + alias + email + status to a CSV file per semester.
+CSV is saved incrementally every 50 lookups so progress is never lost.
 
 Usage:
     python scraper.py [--semester CODE [CODE ...]] [--college NAME] [--max-names N]
@@ -63,9 +64,10 @@ SEMESTER_LABELS = {
     "201910": "Fall 2018",
 }
 
-DEFAULT_SEMESTERS = ["202520", "202310", "202320"]  # Spring 2025, Fall 2022, Spring 2023
+DEFAULT_SEMESTERS = ["202520", "202310", "202320"]
 DEFAULT_COLLEGE = "science"
-PRINT_EVERY = 50  # print progress every N lookups
+PRINT_EVERY = 50
+SAVE_EVERY = 50  # flush CSV to disk every N lookups
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 
@@ -96,7 +98,7 @@ def fetch_honors_names(
     """
     Fetch all rows from the server-side DataTables endpoint in one request,
     then filter client-side by semesters and deduplicate by first+last name.
-    Returns a dict mapping semester label → list of records.
+    Returns a dict mapping semester label -> list of records.
     """
     sess = session or requests.Session()
     semester_labels = {SEMESTER_LABELS[s] for s in semesters if s in SEMESTER_LABELS}
@@ -194,7 +196,7 @@ def _name_matches(directory_name: str, first: str, last: str) -> bool:
     return last_matches and first_matches
 
 
-def lookup_directory_requests(
+def lookup_directory(
     record: StudentRecord,
     session: requests.Session,
 ) -> None:
@@ -270,83 +272,7 @@ def lookup_directory_requests(
         record.status = "unmatched"
 
 # ---------------------------------------------------------------------------
-# Step 2b — Playwright fallback (only for error/unmatched from requests)
-# ---------------------------------------------------------------------------
-
-_BROWSER_LAUNCHED = False
-_PW_CONTEXT = None
-
-
-def _ensure_playwright():
-    """Lazy-init a Playwright browser context."""
-    global _BROWSER_LAUNCHED, _PW_CONTEXT
-    if _BROWSER_LAUNCHED:
-        return _PW_CONTEXT
-
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        print("[browser] playwright not installed — skipping browser fallback.")
-        return None
-
-    pw = sync_playwright().start()
-    browser = pw.chromium.launch(headless=True)
-    _PW_CONTEXT = browser.new_context()
-    _BROWSER_LAUNCHED = True
-    return _PW_CONTEXT
-
-
-def lookup_directory_browser(record: StudentRecord) -> None:
-    """Fallback: use Playwright to search the directory and parse results."""
-    ctx = _ensure_playwright()
-    if ctx is None:
-        return
-
-    page = ctx.new_page()
-    try:
-        page.goto(DIRECTORY_URL, timeout=15000)
-        search_box = page.locator("#basicSearchInput")
-        search_box.wait_for(state="visible", timeout=5000)
-
-        search_name = f"{record.first_name} {record.last_name}"
-        search_box.fill(search_name)
-        page.keyboard.press("Enter")
-        page.wait_for_load_state("networkidle", timeout=10000)
-
-        html = page.content()
-        soup = BeautifulSoup(html, "lxml")
-        results_section = soup.find("section", id="results")
-        if not results_section:
-            record.status = "unmatched"
-            return
-
-        people = results_section.find_all("li")
-        for person_li in people:
-            cn_tag = person_li.find("h2", class_="cn-name")
-            if not cn_tag:
-                continue
-            cn_name = cn_tag.get_text(strip=True)
-
-            if not _name_matches(cn_name, record.first_name, record.last_name):
-                continue
-
-            alias_tag = person_li.find("th", class_="icon-key")
-            if alias_tag:
-                alias_td = alias_tag.find_next_sibling("td")
-                if alias_td:
-                    record.alias = alias_td.get_text(strip=True)
-                    record.email = f"{record.alias}@purdue.edu"
-                    record.status = "matched"
-                    return
-
-        record.status = "unmatched"
-    except Exception as exc:
-        record.status = "error_request"
-    finally:
-        page.close()
-
-# ---------------------------------------------------------------------------
-# Step 3 — Write CSV
+# CSV helpers
 # ---------------------------------------------------------------------------
 
 def _semester_label_to_filename(college: str, semester_label: str) -> str:
@@ -359,19 +285,18 @@ def _semester_label_to_filename(college: str, semester_label: str) -> str:
 
 
 def write_csv(records: list[StudentRecord], path: str) -> None:
+    """Write all records to CSV (overwrites existing file)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(["name", "semester", "alias", "email", "status"])
         for r in records:
             writer.writerow([r.full_name, r.semester, r.alias or "", r.email or "", r.status])
-    print(f"[csv] Wrote {len(records)} rows → {path}")
 
 # ---------------------------------------------------------------------------
-# Concurrent directory lookup
+# Concurrent directory lookup with incremental CSV saves
 # ---------------------------------------------------------------------------
 
-_print_lock = Lock()
 _counter_lock = Lock()
 
 
@@ -381,7 +306,7 @@ def _lookup_worker(
     delay: float,
 ) -> StudentRecord:
     """Worker function for threaded directory lookups."""
-    lookup_directory_requests(record, session)
+    lookup_directory(record, session)
     if delay > 0:
         time.sleep(delay)
     return record
@@ -392,8 +317,9 @@ def lookup_batch_concurrent(
     session: requests.Session,
     delay: float,
     workers: int,
+    csv_path: str,
 ) -> None:
-    """Look up a list of records using a thread pool."""
+    """Look up a list of records using a thread pool, saving CSV every SAVE_EVERY."""
     total = len(records)
     done = 0
     matched = 0
@@ -412,15 +338,26 @@ def lookup_batch_concurrent(
                 done += 1
                 if rec.status == "matched":
                     matched += 1
-                if done % PRINT_EVERY == 0 or done == total:
-                    elapsed = time.time() - t0
-                    rate = done / elapsed if elapsed > 0 else 0
-                    print(
-                        f"  [{done}/{total}]  "
-                        f"matched={matched}  "
-                        f"({rate:.1f} names/sec, "
-                        f"{elapsed:.0f}s elapsed)"
-                    )
+
+                should_save = (done % SAVE_EVERY == 0) or (done == total)
+                should_print = (done % PRINT_EVERY == 0) or (done == total)
+
+            if should_save:
+                write_csv(records, csv_path)
+
+            if should_print:
+                elapsed = time.time() - t0
+                rate = done / elapsed if elapsed > 0 else 0
+                print(
+                    f"  [{done}/{total}]  "
+                    f"matched={matched}  "
+                    f"({rate:.1f}/sec, {elapsed:.0f}s)  "
+                    f"[saved]" if should_save else
+                    f"  [{done}/{total}]  "
+                    f"matched={matched}  "
+                    f"({rate:.1f}/sec, {elapsed:.0f}s)"
+                )
+                sys.stdout.flush()
 
 # ---------------------------------------------------------------------------
 # Orchestrator
@@ -432,7 +369,6 @@ def run(
     max_names: Optional[int],
     delay: float,
     workers: int,
-    use_browser_fallback: bool,
 ) -> None:
     session = requests.Session()
     session.headers.update(
@@ -451,38 +387,34 @@ def run(
         print("[!] No names found. Check semester codes or network.")
         sys.exit(1)
 
-    # 2. Process each semester → separate CSV
+    # 2. Process each semester -> separate CSV
     for semester_label, records in per_semester.items():
         if not records:
             print(f"\n[skip] {semester_label}: no records, skipping.")
             continue
 
-        print(f"\n{'='*60}")
-        print(f"  Processing: {semester_label}  ({len(records)} names)")
-        print(f"{'='*60}\n")
-
-        # 2a. Concurrent directory lookups
-        lookup_batch_concurrent(records, session, delay, workers)
-
-        # 2b. Browser fallback for failures
-        need_fallback = [r for r in records if r.status in ("unmatched", "error_request")]
-        if need_fallback and use_browser_fallback:
-            print(f"\n[browser] Retrying {len(need_fallback)} names with Playwright …")
-            for rec in need_fallback:
-                lookup_directory_browser(rec)
-
-        # 3. Write CSV for this semester
         filename = _semester_label_to_filename(college, semester_label)
         csv_path = os.path.join(OUTPUT_DIR, filename)
+
+        print(f"\n{'='*60}")
+        print(f"  {semester_label}  ({len(records)} names)")
+        print(f"  -> {csv_path}")
+        print(f"{'='*60}\n")
+
+        # Concurrent directory lookups with incremental CSV saves
+        lookup_batch_concurrent(records, session, delay, workers, csv_path)
+
+        # Final save
         write_csv(records, csv_path)
 
-        # Summary for this semester
+        # Summary
         statuses: dict[str, int] = {}
         for r in records:
             statuses[r.status] = statuses.get(r.status, 0) + 1
-        print(f"[summary] {semester_label}:")
+        print(f"\n[summary] {semester_label}:")
         for s, cnt in sorted(statuses.items()):
             print(f"  {s}: {cnt}")
+        print(f"[csv] {csv_path}")
 
     print(f"\n[done] All semesters processed. Files in {OUTPUT_DIR}/")
 
@@ -492,7 +424,7 @@ def run(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Scrape Purdue honors names → directory aliases → CSV emails."
+        description="Scrape Purdue honors names -> directory aliases -> CSV emails."
     )
     parser.add_argument(
         "--semester",
@@ -524,11 +456,6 @@ def main() -> None:
         default=8,
         help="Number of concurrent lookup threads (default: 8).",
     )
-    parser.add_argument(
-        "--no-browser",
-        action="store_true",
-        help="Skip the Playwright browser fallback for unmatched names.",
-    )
     args = parser.parse_args()
 
     run(
@@ -537,7 +464,6 @@ def main() -> None:
         max_names=args.max_names,
         delay=args.delay,
         workers=args.workers,
-        use_browser_fallback=not args.no_browser,
     )
 
 
