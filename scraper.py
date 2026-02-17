@@ -293,6 +293,33 @@ def write_csv(records: list[StudentRecord], path: str) -> None:
         for r in records:
             writer.writerow([r.full_name, r.semester, r.alias or "", r.email or "", r.status])
 
+
+def write_unique_combined_csv(
+    all_records: list[StudentRecord],
+    college: str,
+) -> str:
+    """
+    Collect all matched email addresses across every semester, deduplicate,
+    write to <college>_all_unique.csv, and return the output path.
+    """
+    seen_emails: set[str] = set()
+    unique_rows: list[tuple[str, str]] = []  # (email, alias)
+
+    for r in all_records:
+        if r.email and r.email not in seen_emails:
+            seen_emails.add(r.email)
+            unique_rows.append((r.email, r.alias or ""))
+
+    out_path = os.path.join(OUTPUT_DIR, f"{college}_all_unique.csv")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(out_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["email", "alias"])
+        for email, alias in sorted(unique_rows):
+            writer.writerow([email, alias])
+
+    return out_path
+
 # ---------------------------------------------------------------------------
 # Concurrent directory lookup with incremental CSV saves
 # ---------------------------------------------------------------------------
@@ -388,6 +415,8 @@ def run(
         sys.exit(1)
 
     # 2. Process each semester -> separate CSV
+    all_records: list[StudentRecord] = []
+
     for semester_label, records in per_semester.items():
         if not records:
             print(f"\n[skip] {semester_label}: no records, skipping.")
@@ -415,6 +444,18 @@ def run(
         for s, cnt in sorted(statuses.items()):
             print(f"  {s}: {cnt}")
         print(f"[csv] {csv_path}")
+
+        all_records.extend(records)
+
+    # 3. Combined unique-email CSV across all semesters
+    if len(per_semester) > 1:
+        unique_path = write_unique_combined_csv(all_records, college)
+        with open(unique_path, newline="", encoding="utf-8") as fh:
+            unique_count = sum(1 for _ in fh) - 1  # subtract header row
+        print(f"\n{'='*60}")
+        print(f"  Combined unique emails: {unique_count}")
+        print(f"  -> {unique_path}")
+        print(f"{'='*60}")
 
     print(f"\n[done] All semesters processed. Files in {OUTPUT_DIR}/")
 
