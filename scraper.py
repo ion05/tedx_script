@@ -2,7 +2,7 @@
 """
 Purdue Dean's List → Directory Email Scraper
 
-Fetches student names from the Purdue College of Science honors page,
+Fetches student names from a college's honors page (Science, Engineering, …),
 looks up each name in the Purdue Directory to find their alias,
 and writes name + alias + email + status to a CSV file per semester.
 CSV is saved incrementally every 50 lookups so progress is never lost.
@@ -12,10 +12,10 @@ Usage:
                       [--delay SECONDS] [--workers N]
 
 Examples:
-    python scraper.py                                    # Default semesters
+    python scraper.py                                    # Default (science)
+    python scraper.py --college engineering --semester 202610 202510 202410 202310
     python scraper.py --semester 202520                  # Spring 2025 only
-    python scraper.py --semester 202520 202310 202320    # Multiple semesters
-    python scraper.py --college engineering              # Different college label
+    python scraper.py --college engineering              # Engineering, default semesters
     python scraper.py --workers 10 --delay 0.05          # Fast parallel lookups
     python scraper.py --max-names 50                     # First 50 unique names
 """
@@ -27,146 +27,46 @@ import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from threading import Lock
 from typing import Optional
 
 import requests
 from bs4 import BeautifulSoup
 
+from name_sources import (
+    StudentRecord,
+    SEMESTER_LABELS,
+    get_provider,
+)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-HONORS_API_URL = (
-    "https://www.science.purdue.edu/php-scripts/certificate/server_processing.php"
-)
 DIRECTORY_URL = "https://www.purdue.edu/directory/"
-
-FETCH_ALL_LENGTH = 70000  # grab every row in one request; API supports it
-
-SEMESTER_LABELS = {
-    "202610": "Fall 2025",
-    "202530": "Summer 2025",
-    "202520": "Spring 2025",
-    "202510": "Fall 2024",
-    "202420": "Spring 2024",
-    "202410": "Fall 2023",
-    "202320": "Spring 2023",
-    "202310": "Fall 2022",
-    "202220": "Spring 2022",
-    "202210": "Fall 2021",
-    "202120": "Spring 2021",
-    "202110": "Fall 2020",
-    "202020": "Spring 2020",
-    "202010": "Fall 2019",
-    "201920": "Spring 2019",
-    "201910": "Fall 2018",
-}
 
 DEFAULT_SEMESTERS = ["202520", "202310", "202320"]
 DEFAULT_COLLEGE = "science"
 PRINT_EVERY = 50
-SAVE_EVERY = 50  # flush CSV to disk every N lookups
+SAVE_EVERY = 50
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 
 # ---------------------------------------------------------------------------
-# Data model
+# Output directory helpers
 # ---------------------------------------------------------------------------
 
-@dataclass
-class StudentRecord:
-    full_name: str
-    first_name: str
-    last_name: str
-    semester: str
-    award: str
-    alias: Optional[str] = None
-    email: Optional[str] = None
-    status: str = "pending"
-
-# ---------------------------------------------------------------------------
-# Step 1 — Fetch names from the honors DataTables API
-# ---------------------------------------------------------------------------
-
-def fetch_honors_names(
-    semesters: list[str],
-    max_names: Optional[int] = None,
-    session: Optional[requests.Session] = None,
-) -> dict[str, list[StudentRecord]]:
+def _output_dir_for_college(college: str) -> str:
     """
-    Fetch all rows from the server-side DataTables endpoint in one request,
-    then filter client-side by semesters and deduplicate by first+last name.
-    Returns a dict mapping semester label -> list of records.
+    Science keeps the original output/ path (backward compatible).
+    Every other college gets output/<college>/.
     """
-    sess = session or requests.Session()
-    semester_labels = {SEMESTER_LABELS[s] for s in semesters if s in SEMESTER_LABELS}
-    labels_display = ", ".join(sorted(semester_labels)) or "all"
-
-    print(f"[honors] Fetching all records from honors API …")
-
-    params = {"draw": 1, "start": 0, "length": FETCH_ALL_LENGTH}
-    try:
-        resp = sess.get(HONORS_API_URL, params=params, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        print(f"[honors] Error fetching data: {exc}")
-        return {}
-
-    all_rows = data.get("data", [])
-    total = data.get("recordsTotal", "?")
-    print(f"[honors] Received {len(all_rows)} rows (server total: {total}).")
-    print(f"[honors] Filtering for semesters: {labels_display} …")
-
-    per_semester: dict[str, list[StudentRecord]] = {label: [] for label in semester_labels}
-    seen_per_semester: dict[str, set[str]] = {label: set() for label in semester_labels}
-
-    for row in all_rows:
-        row_semester = row.get("1", "")
-        if row_semester not in semester_labels:
-            continue
-
-        full_name = row.get("0", "").strip()
-        first_name = row.get("4", "").strip()
-        last_name = row.get("5", "").strip()
-        award = row.get("2", "").strip()
-
-        if not full_name or not first_name or not last_name:
-            continue
-
-        dedup_key = f"{first_name.lower()}|{last_name.lower()}"
-        if dedup_key in seen_per_semester[row_semester]:
-            continue
-        seen_per_semester[row_semester].add(dedup_key)
-
-        per_semester[row_semester].append(
-            StudentRecord(
-                full_name=full_name,
-                first_name=first_name,
-                last_name=last_name,
-                semester=row_semester,
-                award=award,
-            )
-        )
-
-        if max_names:
-            all_full = all(len(v) >= max_names for v in per_semester.values())
-            if all_full:
-                break
-            if len(per_semester[row_semester]) >= max_names:
-                continue
-
-    for label, recs in per_semester.items():
-        if max_names:
-            per_semester[label] = recs[:max_names]
-        print(f"[honors]   {label}: {len(per_semester[label])} unique names")
-
-    return per_semester
+    if college == "science":
+        return OUTPUT_DIR
+    return os.path.join(OUTPUT_DIR, college)
 
 # ---------------------------------------------------------------------------
-# Step 2 — Look up alias in the Purdue Directory (requests + BS4)
+# Step 2 — Look up alias in the Purdue Directory (shared for all colleges)
 # ---------------------------------------------------------------------------
 
 def _normalize(name: str) -> str:
@@ -303,15 +203,16 @@ def write_unique_combined_csv(
     write to <college>_all_unique.csv, and return the output path.
     """
     seen_emails: set[str] = set()
-    unique_rows: list[tuple[str, str]] = []  # (email, alias)
+    unique_rows: list[tuple[str, str]] = []
 
     for r in all_records:
         if r.email and r.email not in seen_emails:
             seen_emails.add(r.email)
             unique_rows.append((r.email, r.alias or ""))
 
-    out_path = os.path.join(OUTPUT_DIR, f"{college}_all_unique.csv")
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    out_dir = _output_dir_for_college(college)
+    out_path = os.path.join(out_dir, f"{college}_all_unique_emails.csv")
+    os.makedirs(out_dir, exist_ok=True)
     with open(out_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(["email", "alias"])
@@ -408,8 +309,13 @@ def run(
         }
     )
 
-    # 1. Fetch names (one API call, split by semester)
-    per_semester = fetch_honors_names(semesters, max_names=max_names, session=session)
+    # Resolve the provider for the requested college
+    fetch_fn = get_provider(college)
+
+    out_dir = _output_dir_for_college(college)
+
+    # 1. Fetch names via the college-specific provider
+    per_semester = fetch_fn(semesters, max_names=max_names, session=session)
     if not per_semester or all(len(v) == 0 for v in per_semester.values()):
         print("[!] No names found. Check semester codes or network.")
         sys.exit(1)
@@ -423,20 +329,17 @@ def run(
             continue
 
         filename = _semester_label_to_filename(college, semester_label)
-        csv_path = os.path.join(OUTPUT_DIR, filename)
+        csv_path = os.path.join(out_dir, filename)
 
         print(f"\n{'='*60}")
         print(f"  {semester_label}  ({len(records)} names)")
         print(f"  -> {csv_path}")
         print(f"{'='*60}\n")
 
-        # Concurrent directory lookups with incremental CSV saves
         lookup_batch_concurrent(records, session, delay, workers, csv_path)
 
-        # Final save
         write_csv(records, csv_path)
 
-        # Summary
         statuses: dict[str, int] = {}
         for r in records:
             statuses[r.status] = statuses.get(r.status, 0) + 1
@@ -451,13 +354,13 @@ def run(
     if len(per_semester) > 1:
         unique_path = write_unique_combined_csv(all_records, college)
         with open(unique_path, newline="", encoding="utf-8") as fh:
-            unique_count = sum(1 for _ in fh) - 1  # subtract header row
+            unique_count = sum(1 for _ in fh) - 1
         print(f"\n{'='*60}")
         print(f"  Combined unique emails: {unique_count}")
         print(f"  -> {unique_path}")
         print(f"{'='*60}")
 
-    print(f"\n[done] All semesters processed. Files in {OUTPUT_DIR}/")
+    print(f"\n[done] All semesters processed. Files in {out_dir}/")
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -477,7 +380,8 @@ def main() -> None:
     parser.add_argument(
         "--college",
         default=DEFAULT_COLLEGE,
-        help="College label for the CSV filename (default: %(default)s).",
+        choices=["science", "engineering"],
+        help="Which college to scrape (default: %(default)s).",
     )
     parser.add_argument(
         "--max-names",

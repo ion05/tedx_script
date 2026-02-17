@@ -1,6 +1,8 @@
 # Purdue Dean's List → Email Scraper
 
-Scrapes student names from the Purdue College of Science Dean's List / Semester Honors page, looks up each name in the Purdue Directory to find their alias, and writes results to one CSV per semester.
+Scrapes student names from Purdue college honors / Dean's List pages, looks up each name in the Purdue Directory to find their alias, and writes results to one CSV per semester.
+
+Currently supports **College of Science** and **College of Engineering**. Adding more colleges is straightforward — just add a new provider function in `name_sources.py`.
 
 ## Setup
 
@@ -16,15 +18,16 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-# Default: Spring 2025 + Fall 2022 + Spring 2023 (8 parallel workers)
+# Default: Science, Spring 2025 + Fall 2022 + Spring 2023
 python scraper.py
+
+# Engineering — Fall 2025 through Fall 2022 (all terms in between)
+python scraper.py --college engineering \
+    --semester 202610 202520 202510 202420 202410 202320 202310
 
 # Specific semester(s)
 python scraper.py --semester 202610              # Fall 2025 only
 python scraper.py --semester 202520 202310       # Spring 2025 + Fall 2022
-
-# Label for a different college (changes CSV filename prefix)
-python scraper.py --college engineering
 
 # Speed tuning
 python scraper.py --workers 12 --delay 0.05      # More threads, less delay
@@ -49,8 +52,17 @@ python scraper.py --max-names 20
 
 ## Output
 
-Each semester gets its own CSV in `output/`, named `{college}_emails_{semester}.csv`.  
-For example: `science_emails_fall_2025.csv`, `science_emails_spring_2023.csv`.
+Each semester gets its own CSV. The output location depends on the college:
+
+| College     | Directory                |
+|-------------|--------------------------|
+| science     | `output/`                |
+| engineering | `output/engineering/`    |
+
+Files are named `{college}_emails_{semester}.csv`.  
+For example: `engineering_emails_fall_2025.csv`, `science_emails_spring_2023.csv`.
+
+When multiple semesters are processed, a combined unique-email CSV is also generated (e.g. `engineering_all_unique_emails.csv`).
 
 | Column   | Description |
 |----------|-------------|
@@ -59,6 +71,11 @@ For example: `science_emails_fall_2025.csv`, `science_emails_spring_2023.csv`.
 | alias    | Purdue directory alias |
 | email    | alias@purdue.edu |
 | status   | `matched`, `unmatched`, `error_request` |
+
+## Architecture
+
+- **`name_sources.py`** — College-specific providers. Each one fetches student names and returns `dict[semester_label, list[StudentRecord]]`. Adding a new college means adding a new `@provider("college_name")` function here.
+- **`scraper.py`** — Shared pipeline: Purdue Directory lookup, concurrent workers, CSV writing, CLI.
 
 ## Troubleshooting
 
