@@ -1,1 +1,0 @@
-source venv/bin/activate && python scraper.py --semester 202610 --no-browser --workers 8 --delay 0.1
