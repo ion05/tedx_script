@@ -4,17 +4,19 @@ Purdue Dean's List → Directory Email Scraper
 
 Fetches student names from the Purdue College of Science honors page,
 looks up each name in the Purdue Directory to find their alias,
-and writes name + alias + email + status to a CSV file.
+and writes name + alias + email + status to a CSV file per semester.
 
 Usage:
-    python scraper.py [--semester CODE [CODE ...]] [--max-names N] [--delay SECONDS]
+    python scraper.py [--semester CODE [CODE ...]] [--college NAME] [--max-names N]
+                      [--delay SECONDS] [--workers N]
 
 Examples:
     python scraper.py                                    # Default semesters
     python scraper.py --semester 202520                  # Spring 2025 only
     python scraper.py --semester 202520 202310 202320    # Multiple semesters
+    python scraper.py --college engineering              # Different college label
+    python scraper.py --workers 10 --delay 0.05          # Fast parallel lookups
     python scraper.py --max-names 50                     # First 50 unique names
-    python scraper.py --delay 0.5                        # 0.5s between lookups
 """
 
 import argparse
@@ -23,7 +25,9 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from threading import Lock
 from typing import Optional
 
 import requests
@@ -60,9 +64,10 @@ SEMESTER_LABELS = {
 }
 
 DEFAULT_SEMESTERS = ["202520", "202310", "202320"]  # Spring 2025, Fall 2022, Spring 2023
+DEFAULT_COLLEGE = "science"
+PRINT_EVERY = 50  # print progress every N lookups
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
-OUTPUT_CSV = os.path.join(OUTPUT_DIR, "emails.csv")
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -87,11 +92,11 @@ def fetch_honors_names(
     semesters: list[str],
     max_names: Optional[int] = None,
     session: Optional[requests.Session] = None,
-) -> list[StudentRecord]:
+) -> dict[str, list[StudentRecord]]:
     """
     Fetch all rows from the server-side DataTables endpoint in one request,
-    then filter client-side by one or more semesters and deduplicate by
-    first+last name.
+    then filter client-side by semesters and deduplicate by first+last name.
+    Returns a dict mapping semester label → list of records.
     """
     sess = session or requests.Session()
     semester_labels = {SEMESTER_LABELS[s] for s in semesters if s in SEMESTER_LABELS}
@@ -106,19 +111,19 @@ def fetch_honors_names(
         data = resp.json()
     except Exception as exc:
         print(f"[honors] Error fetching data: {exc}")
-        return []
+        return {}
 
     all_rows = data.get("data", [])
     total = data.get("recordsTotal", "?")
     print(f"[honors] Received {len(all_rows)} rows (server total: {total}).")
     print(f"[honors] Filtering for semesters: {labels_display} …")
 
-    seen_keys: set[str] = set()
-    records: list[StudentRecord] = []
+    per_semester: dict[str, list[StudentRecord]] = {label: [] for label in semester_labels}
+    seen_per_semester: dict[str, set[str]] = {label: set() for label in semester_labels}
 
     for row in all_rows:
         row_semester = row.get("1", "")
-        if semester_labels and row_semester not in semester_labels:
+        if row_semester not in semester_labels:
             continue
 
         full_name = row.get("0", "").strip()
@@ -130,11 +135,11 @@ def fetch_honors_names(
             continue
 
         dedup_key = f"{first_name.lower()}|{last_name.lower()}"
-        if dedup_key in seen_keys:
+        if dedup_key in seen_per_semester[row_semester]:
             continue
-        seen_keys.add(dedup_key)
+        seen_per_semester[row_semester].add(dedup_key)
 
-        records.append(
+        per_semester[row_semester].append(
             StudentRecord(
                 full_name=full_name,
                 first_name=first_name,
@@ -144,11 +149,19 @@ def fetch_honors_names(
             )
         )
 
-        if max_names and len(records) >= max_names:
-            break
+        if max_names:
+            all_full = all(len(v) >= max_names for v in per_semester.values())
+            if all_full:
+                break
+            if len(per_semester[row_semester]) >= max_names:
+                continue
 
-    print(f"[honors] Collected {len(records)} unique student names.")
-    return records
+    for label, recs in per_semester.items():
+        if max_names:
+            per_semester[label] = recs[:max_names]
+        print(f"[honors]   {label}: {len(per_semester[label])} unique names")
+
+    return per_semester
 
 # ---------------------------------------------------------------------------
 # Step 2 — Look up alias in the Purdue Directory (requests + BS4)
@@ -199,7 +212,6 @@ def lookup_directory_requests(
         resp.raise_for_status()
     except Exception as exc:
         record.status = "error_request"
-        print(f"  [dir] HTTP error for '{search_name}': {exc}")
         return
 
     soup = BeautifulSoup(resp.text, "lxml")
@@ -305,7 +317,7 @@ def lookup_directory_browser(record: StudentRecord) -> None:
         soup = BeautifulSoup(html, "lxml")
         results_section = soup.find("section", id="results")
         if not results_section:
-            record.status = "unmatched_browser"
+            record.status = "unmatched"
             return
 
         people = results_section.find_all("li")
@@ -329,7 +341,6 @@ def lookup_directory_browser(record: StudentRecord) -> None:
 
         record.status = "unmatched"
     except Exception as exc:
-        print(f"  [browser] Error for '{record.full_name}': {exc}")
         record.status = "error_request"
     finally:
         page.close()
@@ -338,6 +349,15 @@ def lookup_directory_browser(record: StudentRecord) -> None:
 # Step 3 — Write CSV
 # ---------------------------------------------------------------------------
 
+def _semester_label_to_filename(college: str, semester_label: str) -> str:
+    """
+    Convert e.g. college='science', semester_label='Fall 2025'
+    to 'science_emails_fall_2025.csv'.
+    """
+    slug = semester_label.lower().replace(" ", "_")
+    return f"{college}_emails_{slug}.csv"
+
+
 def write_csv(records: list[StudentRecord], path: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as fh:
@@ -345,13 +365,75 @@ def write_csv(records: list[StudentRecord], path: str) -> None:
         writer.writerow(["name", "semester", "alias", "email", "status"])
         for r in records:
             writer.writerow([r.full_name, r.semester, r.alias or "", r.email or "", r.status])
-    print(f"\n[csv] Wrote {len(records)} rows → {path}")
+    print(f"[csv] Wrote {len(records)} rows → {path}")
+
+# ---------------------------------------------------------------------------
+# Concurrent directory lookup
+# ---------------------------------------------------------------------------
+
+_print_lock = Lock()
+_counter_lock = Lock()
+
+
+def _lookup_worker(
+    record: StudentRecord,
+    session: requests.Session,
+    delay: float,
+) -> StudentRecord:
+    """Worker function for threaded directory lookups."""
+    lookup_directory_requests(record, session)
+    if delay > 0:
+        time.sleep(delay)
+    return record
+
+
+def lookup_batch_concurrent(
+    records: list[StudentRecord],
+    session: requests.Session,
+    delay: float,
+    workers: int,
+) -> None:
+    """Look up a list of records using a thread pool."""
+    total = len(records)
+    done = 0
+    matched = 0
+    t0 = time.time()
+
+    print(f"[dir] Looking up {total} names ({workers} workers, {delay}s delay) …")
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_lookup_worker, rec, session, delay): rec
+            for rec in records
+        }
+        for future in as_completed(futures):
+            rec = future.result()
+            with _counter_lock:
+                done += 1
+                if rec.status == "matched":
+                    matched += 1
+                if done % PRINT_EVERY == 0 or done == total:
+                    elapsed = time.time() - t0
+                    rate = done / elapsed if elapsed > 0 else 0
+                    print(
+                        f"  [{done}/{total}]  "
+                        f"matched={matched}  "
+                        f"({rate:.1f} names/sec, "
+                        f"{elapsed:.0f}s elapsed)"
+                    )
 
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
-def run(semesters: list[str], max_names: Optional[int], delay: float, use_browser_fallback: bool) -> None:
+def run(
+    semesters: list[str],
+    college: str,
+    max_names: Optional[int],
+    delay: float,
+    workers: int,
+    use_browser_fallback: bool,
+) -> None:
     session = requests.Session()
     session.headers.update(
         {
@@ -363,44 +445,46 @@ def run(semesters: list[str], max_names: Optional[int], delay: float, use_browse
         }
     )
 
-    # 1. Fetch names
-    records = fetch_honors_names(semesters, max_names=max_names, session=session)
-    if not records:
-        print("[!] No names found. Check semester code or network.")
+    # 1. Fetch names (one API call, split by semester)
+    per_semester = fetch_honors_names(semesters, max_names=max_names, session=session)
+    if not per_semester or all(len(v) == 0 for v in per_semester.values()):
+        print("[!] No names found. Check semester codes or network.")
         sys.exit(1)
 
-    # 2. Directory lookups
-    total = len(records)
-    print(f"\n[dir] Looking up {total} names in Purdue Directory …\n")
-    for idx, rec in enumerate(records, 1):
-        print(f"  [{idx}/{total}] {rec.full_name} … ", end="", flush=True)
-        lookup_directory_requests(rec, session)
-        print(f"{rec.status}" + (f"  →  {rec.email}" if rec.email else ""))
+    # 2. Process each semester → separate CSV
+    for semester_label, records in per_semester.items():
+        if not records:
+            print(f"\n[skip] {semester_label}: no records, skipping.")
+            continue
 
-        if delay > 0:
-            time.sleep(delay)
+        print(f"\n{'='*60}")
+        print(f"  Processing: {semester_label}  ({len(records)} names)")
+        print(f"{'='*60}\n")
 
-    # 2b. Browser fallback for failures
-    need_fallback = [r for r in records if r.status in ("unmatched", "error_request")]
-    if need_fallback and use_browser_fallback:
-        print(f"\n[browser] Retrying {len(need_fallback)} names with Playwright …\n")
-        for idx, rec in enumerate(need_fallback, 1):
-            print(f"  [{idx}/{len(need_fallback)}] {rec.full_name} … ", end="", flush=True)
-            lookup_directory_browser(rec)
-            print(f"{rec.status}" + (f"  →  {rec.email}" if rec.email else ""))
-            if delay > 0:
-                time.sleep(delay)
+        # 2a. Concurrent directory lookups
+        lookup_batch_concurrent(records, session, delay, workers)
 
-    # 3. Write CSV
-    write_csv(records, OUTPUT_CSV)
+        # 2b. Browser fallback for failures
+        need_fallback = [r for r in records if r.status in ("unmatched", "error_request")]
+        if need_fallback and use_browser_fallback:
+            print(f"\n[browser] Retrying {len(need_fallback)} names with Playwright …")
+            for rec in need_fallback:
+                lookup_directory_browser(rec)
 
-    # Summary
-    statuses: dict[str, int] = {}
-    for r in records:
-        statuses[r.status] = statuses.get(r.status, 0) + 1
-    print("\n[summary]")
-    for s, cnt in sorted(statuses.items()):
-        print(f"  {s}: {cnt}")
+        # 3. Write CSV for this semester
+        filename = _semester_label_to_filename(college, semester_label)
+        csv_path = os.path.join(OUTPUT_DIR, filename)
+        write_csv(records, csv_path)
+
+        # Summary for this semester
+        statuses: dict[str, int] = {}
+        for r in records:
+            statuses[r.status] = statuses.get(r.status, 0) + 1
+        print(f"[summary] {semester_label}:")
+        for s, cnt in sorted(statuses.items()):
+            print(f"  {s}: {cnt}")
+
+    print(f"\n[done] All semesters processed. Files in {OUTPUT_DIR}/")
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -418,16 +502,27 @@ def main() -> None:
         f"Codes: {', '.join(f'{k}={v}' for k, v in list(SEMESTER_LABELS.items())[:8])} …",
     )
     parser.add_argument(
+        "--college",
+        default=DEFAULT_COLLEGE,
+        help="College label for the CSV filename (default: %(default)s).",
+    )
+    parser.add_argument(
         "--max-names",
         type=int,
         default=None,
-        help="Cap the number of unique names to process (useful for testing).",
+        help="Cap the number of unique names per semester (useful for testing).",
     )
     parser.add_argument(
         "--delay",
         type=float,
-        default=0.3,
-        help="Seconds to wait between directory lookups (default: 0.3).",
+        default=0.1,
+        help="Seconds to wait between directory lookups per worker (default: 0.1).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Number of concurrent lookup threads (default: 8).",
     )
     parser.add_argument(
         "--no-browser",
@@ -438,8 +533,10 @@ def main() -> None:
 
     run(
         semesters=args.semester,
+        college=args.college,
         max_names=args.max_names,
         delay=args.delay,
+        workers=args.workers,
         use_browser_fallback=not args.no_browser,
     )
 
