@@ -291,3 +291,140 @@ def fetch_engineering_names(
         print(f"[engineering]   {label}: {len(records)} unique names")
 
     return per_semester
+
+
+# ---------------------------------------------------------------------------
+# Polytechnic provider
+# ---------------------------------------------------------------------------
+
+# Only two Polytechnic Dean's List pages exist.
+POLYTECHNIC_SEMESTER_URLS: dict[str, str] = {
+    "Fall 2025": "https://polytechnic.purdue.edu/office-dean/deans-list",
+    "Spring 2024": (
+        "https://old.polytechnic.purdue.edu"
+        "/undergraduate-studies/deans-list/spring-2024-deans-list"
+    ),
+}
+
+
+def _parse_polytechnic_page(
+    html: str,
+    semester_label: str,
+    max_names: Optional[int] = None,
+) -> list[StudentRecord]:
+    """
+    Parse student names from a Polytechnic Dean's List page.
+
+    Both the new site and the old site render names as the first <td> of each
+    table row in "Last, First [M.]" format (e.g. "Smith, Jane A.").
+    Award text lives in the second column on the old site and the third column
+    on the new site; we read whichever is available.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    records: list[StudentRecord] = []
+    seen: set[str] = set()
+
+    for row in soup.find_all("tr"):
+        cells = row.find_all("td")
+        if not cells:
+            continue
+
+        name_text = cells[0].get_text(strip=True)
+
+        # Must contain a comma and not be a header cell
+        if not name_text or "," not in name_text or name_text.lower().startswith("name"):
+            continue
+
+        parts = name_text.split(",", 1)
+        if len(parts) < 2:
+            continue
+
+        last_name = parts[0].strip().title()
+        first_rest = parts[1].strip()
+        first_tokens = first_rest.split()
+        if not first_tokens:
+            continue
+        first_name = first_tokens[0].title()
+
+        if not first_name or not last_name:
+            continue
+
+        dedup_key = f"{first_name.lower()}|{last_name.lower()}"
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
+        # Grab award from whichever column is available (column 1 on old site,
+        # column 2 on new site); fall back to a generic label.
+        if len(cells) >= 3:
+            award = cells[2].get_text(strip=True)
+        elif len(cells) >= 2:
+            award = cells[1].get_text(strip=True)
+        else:
+            award = "Dean's List"
+
+        records.append(
+            StudentRecord(
+                full_name=f"{first_name} {last_name}",
+                first_name=first_name,
+                last_name=last_name,
+                semester=semester_label,
+                award=award,
+            )
+        )
+
+        if max_names and len(records) >= max_names:
+            break
+
+    return records
+
+
+@provider("polytechnic")
+def fetch_polytechnic_names(
+    semesters: list[str],
+    max_names: Optional[int] = None,
+    session: Optional[requests.Session] = None,
+) -> dict[str, list[StudentRecord]]:
+    """
+    Scrape Polytechnic Dean's List pages for the requested semesters.
+
+    Fall 2025 and later are fetched from the current site; earlier semesters
+    are fetched from the archived old site.
+    Returns dict mapping semester label -> list[StudentRecord].
+    """
+    sess = session or requests.Session()
+
+    requested_labels = {SEMESTER_LABELS[s] for s in semesters if s in SEMESTER_LABELS}
+    if not requested_labels:
+        print("[polytechnic] No valid semester codes provided.")
+        return {}
+
+    available = set(POLYTECHNIC_SEMESTER_URLS)
+    per_semester: dict[str, list[StudentRecord]] = {}
+
+    for label in sorted(requested_labels):
+        if label not in available:
+            print(
+                f"[polytechnic] {label}: no data available. "
+                f"Supported: {', '.join(sorted(available))}"
+            )
+            continue
+
+        url = POLYTECHNIC_SEMESTER_URLS[label]
+        print(f"[polytechnic] Fetching {label} from {url} …")
+
+        try:
+            resp = sess.get(url, timeout=60)
+            resp.raise_for_status()
+        except Exception as exc:
+            print(f"[polytechnic] Error fetching {label}: {exc}")
+            continue
+
+        records = _parse_polytechnic_page(resp.text, label, max_names=max_names)
+        if not records:
+            print(f"[polytechnic]   {label}: 0 names found (page may not exist or format changed).")
+        else:
+            per_semester[label] = records
+            print(f"[polytechnic]   {label}: {len(records)} unique names")
+
+    return per_semester
