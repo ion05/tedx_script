@@ -428,3 +428,150 @@ def fetch_polytechnic_names(
             print(f"[polytechnic]   {label}: {len(records)} unique names")
 
     return per_semester
+
+
+# ---------------------------------------------------------------------------
+# CLA (College of Liberal Arts) provider
+# ---------------------------------------------------------------------------
+
+CLA_BASE_URL = "https://www.cla.purdue.edu/students/awards-honors/deans-list"
+
+CLA_SEMESTER_URLS: dict[str, str] = {
+    "Fall 2025": f"{CLA_BASE_URL}/index.html",
+    "Spring 2025": f"{CLA_BASE_URL}/deans-list-s25.html",
+    "Fall 2024": f"{CLA_BASE_URL}/deans-list-f24.html",
+    "Spring 2024": f"{CLA_BASE_URL}/deans-list-s24.html",
+    "Fall 2023": f"{CLA_BASE_URL}/deans-list-f23.html",
+    "Fall 2022": f"{CLA_BASE_URL}/deans-list-f22.html",
+}
+
+_CLA_SKIP_PREFIXES = ("key:", "dean's", "#", "a |", "b |")
+
+
+def _parse_cla_page(
+    html: str,
+    semester_label: str,
+    max_names: Optional[int] = None,
+) -> list[StudentRecord]:
+    """
+    Parse student names from a CLA Dean's List page.
+
+    Names appear as plain text lines in "Last, First [M.] [* [+]]" format.
+    ``*`` indicates Dean's List; ``+`` indicates Semester Honors.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text(separator="\n")
+
+    records: list[StudentRecord] = []
+    seen: set[str] = set()
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "," not in line:
+            continue
+
+        low = line.lower()
+        if any(low.startswith(p) for p in _CLA_SKIP_PREFIXES):
+            continue
+        if "back to top" in low:
+            continue
+
+        parts = line.split(",", 1)
+        if len(parts) < 2:
+            continue
+
+        last_name = parts[0].strip()
+        rest = parts[1].strip()
+
+        if not last_name or not last_name[0].isalpha():
+            continue
+        if not rest or not rest[0].isalpha():
+            continue
+
+        has_star = "*" in rest
+        has_plus = "+" in rest
+        if has_star and has_plus:
+            award = "Dean's List + Semester Honors"
+        elif has_star:
+            award = "Dean's List"
+        elif has_plus:
+            award = "Semester Honors"
+        else:
+            award = ""
+
+        rest_clean = rest.replace("*", "").replace("+", "").strip()
+        rest_clean = re.sub(r"\s+", " ", rest_clean).strip()
+
+        tokens = rest_clean.split()
+        if not tokens:
+            continue
+
+        first_name = tokens[0]
+
+        dedup_key = f"{first_name.lower()}|{last_name.lower()}"
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
+        records.append(
+            StudentRecord(
+                full_name=f"{first_name} {last_name}",
+                first_name=first_name,
+                last_name=last_name,
+                semester=semester_label,
+                award=award,
+            )
+        )
+
+        if max_names and len(records) >= max_names:
+            break
+
+    return records
+
+
+@provider("cla")
+def fetch_cla_names(
+    semesters: list[str],
+    max_names: Optional[int] = None,
+    session: Optional[requests.Session] = None,
+) -> dict[str, list[StudentRecord]]:
+    """
+    Scrape CLA Dean's List pages for the requested semesters.
+    Returns dict mapping semester label -> list[StudentRecord].
+    """
+    sess = session or requests.Session()
+
+    requested_labels = {SEMESTER_LABELS[s] for s in semesters if s in SEMESTER_LABELS}
+    if not requested_labels:
+        print("[cla] No valid semester codes provided.")
+        return {}
+
+    available = set(CLA_SEMESTER_URLS)
+    per_semester: dict[str, list[StudentRecord]] = {}
+
+    for label in sorted(requested_labels):
+        if label not in available:
+            print(
+                f"[cla] {label}: no data available. "
+                f"Supported: {', '.join(sorted(available))}"
+            )
+            continue
+
+        url = CLA_SEMESTER_URLS[label]
+        print(f"[cla] Fetching {label} from {url} …")
+
+        try:
+            resp = sess.get(url, timeout=60)
+            resp.raise_for_status()
+        except Exception as exc:
+            print(f"[cla] Error fetching {label}: {exc}")
+            continue
+
+        records = _parse_cla_page(resp.text, label, max_names=max_names)
+        if not records:
+            print(f"[cla]   {label}: 0 names found (page may not exist or format changed).")
+        else:
+            per_semester[label] = records
+            print(f"[cla]   {label}: {len(records)} unique names")
+
+    return per_semester
