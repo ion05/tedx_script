@@ -575,3 +575,168 @@ def fetch_cla_names(
             print(f"[cla]   {label}: {len(records)} unique names")
 
     return per_semester
+
+
+# ---------------------------------------------------------------------------
+# Agriculture provider
+# ---------------------------------------------------------------------------
+
+AGRICULTURE_BASE_URL = "https://ag.purdue.edu/department/oap/awards/students.php"
+
+AGRICULTURE_SEMESTER_URLS: dict[str, str] = {
+    "Fall 2025": f"{AGRICULTURE_BASE_URL}?list=fall2025#top",
+    "Spring 2025": f"{AGRICULTURE_BASE_URL}?list=spring2025#top",
+    "Fall 2024": f"{AGRICULTURE_BASE_URL}?list=fall2024#top",
+    "Spring 2024": f"{AGRICULTURE_BASE_URL}?list=spring2024#top",
+    "Fall 2023": f"{AGRICULTURE_BASE_URL}?list=fall2023#top",
+    "Spring 2023": f"{AGRICULTURE_BASE_URL}?list=spring2023#top",
+    "Fall 2022": f"{AGRICULTURE_BASE_URL}?list=fall2022#top",
+}
+
+_AGRICULTURE_SKIP_PATTERNS = [
+    "back to top",
+    "dean's list requirements",
+    "semester honors requirements",
+    "select a semester",
+    "attain at least",
+    "have at least",
+]
+
+
+def _parse_agriculture_page(
+    html: str,
+    semester_label: str,
+    max_names: Optional[int] = None,
+) -> list[StudentRecord]:
+    """
+    Parse student names from an Agriculture Dean's List page.
+
+    Names appear in <strong> tags followed by major and award text.
+    Format: <strong>FirstName LastName</strong>Major1Major2Award
+    """
+    soup = BeautifulSoup(html, "lxml")
+    
+    records: list[StudentRecord] = []
+    seen: set[str] = set()
+
+    # Find all <strong> tags which contain student names
+    for strong_tag in soup.find_all("strong"):
+        full_name = strong_tag.get_text(strip=True)
+        
+        # Skip if empty or looks like a header
+        if not full_name:
+            continue
+        
+        low = full_name.lower()
+        if any(skip in low for skip in _AGRICULTURE_SKIP_PATTERNS):
+            continue
+        
+        # Names should have at least 2 words
+        parts = full_name.split()
+        if len(parts) < 2:
+            continue
+        
+        # Skip single letter entries (navigation)
+        if len(full_name) <= 2:
+            continue
+            
+        # Extract first and last name
+        first_name = parts[0]
+        last_name = parts[-1]
+        
+        # Get the text after the strong tag to find award info
+        award = ""
+        next_text = ""
+        
+        # Navigate siblings to find award text
+        sibling = strong_tag.next_sibling
+        while sibling and len(next_text) < 200:  # Limit search
+            if isinstance(sibling, str):
+                next_text += sibling
+            elif hasattr(sibling, 'get_text'):
+                next_text += sibling.get_text()
+            sibling = sibling.next_sibling if sibling else None
+            
+            # Stop if we found award text
+            if "Dean's List" in next_text or "Semester Honors" in next_text:
+                break
+        
+        # Extract award from the text
+        if "Dean's List & Semester Honors" in next_text:
+            award = "Dean's List & Semester Honors"
+        elif "Dean's List" in next_text:
+            award = "Dean's List"
+        elif "Semester Honors" in next_text:
+            award = "Semester Honors"
+        else:
+            # No award found, skip this entry
+            continue
+        
+        # Deduplicate
+        dedup_key = f"{first_name.lower()}|{last_name.lower()}"
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        
+        records.append(
+            StudentRecord(
+                full_name=full_name,
+                first_name=first_name,
+                last_name=last_name,
+                semester=semester_label,
+                award=award,
+            )
+        )
+        
+        if max_names and len(records) >= max_names:
+            break
+    
+    return records
+
+
+@provider("agriculture")
+def fetch_agriculture_names(
+    semesters: list[str],
+    max_names: Optional[int] = None,
+    session: Optional[requests.Session] = None,
+) -> dict[str, list[StudentRecord]]:
+    """
+    Scrape Agriculture Dean's List pages for the requested semesters.
+    Returns dict mapping semester label -> list[StudentRecord].
+    """
+    sess = session or requests.Session()
+
+    requested_labels = {SEMESTER_LABELS[s] for s in semesters if s in SEMESTER_LABELS}
+    if not requested_labels:
+        print("[agriculture] No valid semester codes provided.")
+        return {}
+
+    available = set(AGRICULTURE_SEMESTER_URLS)
+    per_semester: dict[str, list[StudentRecord]] = {}
+
+    for label in sorted(requested_labels):
+        if label not in available:
+            print(
+                f"[agriculture] {label}: no data available. "
+                f"Supported: {', '.join(sorted(available))}"
+            )
+            continue
+
+        url = AGRICULTURE_SEMESTER_URLS[label]
+        print(f"[agriculture] Fetching {label} from {url} …")
+
+        try:
+            resp = sess.get(url, timeout=60)
+            resp.raise_for_status()
+        except Exception as exc:
+            print(f"[agriculture] Error fetching {label}: {exc}")
+            continue
+
+        records = _parse_agriculture_page(resp.text, label, max_names=max_names)
+        if not records:
+            print(f"[agriculture]   {label}: 0 names found (page may not exist or format changed).")
+        else:
+            per_semester[label] = records
+            print(f"[agriculture]   {label}: {len(records)} unique names")
+
+    return per_semester
