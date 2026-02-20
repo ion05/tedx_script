@@ -740,3 +740,160 @@ def fetch_agriculture_names(
             print(f"[agriculture]   {label}: {len(records)} unique names")
 
     return per_semester
+
+
+# ---------------------------------------------------------------------------
+# Business provider
+# ---------------------------------------------------------------------------
+
+BUSINESS_BASE_URL = "https://business.purdue.edu/awards/students.php"
+
+BUSINESS_SEMESTER_URLS: dict[str, str] = {
+    "Fall 2025":   f"{BUSINESS_BASE_URL}?list=fall2025#top",
+    "Spring 2025": f"{BUSINESS_BASE_URL}?list=spring2025#top",
+    "Fall 2024":   f"{BUSINESS_BASE_URL}?list=fall2024#top",
+    "Spring 2024": f"{BUSINESS_BASE_URL}?list=spring2024#top",
+    "Fall 2023":   f"{BUSINESS_BASE_URL}?list=fall2023#top",
+    "Spring 2023": f"{BUSINESS_BASE_URL}?list=spring2023#top",
+    "Fall 2022":   f"{BUSINESS_BASE_URL}?list=fall2022#top",
+}
+
+_BUSINESS_SKIP_PATTERNS = [
+    "back to top",
+    "dean's list and semester honors",
+    "select a semester",
+    "attain at least",
+    "have at least",
+    "dean's list requirements",
+    "semester honors requirements",
+    "building the future",
+]
+
+
+def _parse_business_page(
+    html: str,
+    semester_label: str,
+    max_names: Optional[int] = None,
+) -> list[StudentRecord]:
+    """
+    Parse student names from a Business school Dean's List page.
+
+    Names appear in <strong> tags inside <li> items.
+    Format: <strong>FirstName LastName</strong>MajorAward
+    Award is the last line of text in the list item:
+    "Dean's List", "Semester Honors", or "Dean's List & Semester Honors".
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    records: list[StudentRecord] = []
+    seen: set[str] = set()
+
+    for strong_tag in soup.find_all("strong"):
+        full_name = strong_tag.get_text(strip=True)
+
+        if not full_name:
+            continue
+
+        low = full_name.lower()
+        if any(skip in low for skip in _BUSINESS_SKIP_PATTERNS):
+            continue
+
+        # Skip single-letter alphabetical navigation anchors
+        if len(full_name) <= 2:
+            continue
+
+        parts = full_name.split()
+        if len(parts) < 2:
+            continue
+
+        first_name = parts[0]
+        last_name = parts[-1]
+
+        # Gather sibling text to extract award info
+        next_text = ""
+        sibling = strong_tag.next_sibling
+        while sibling and len(next_text) < 300:
+            if isinstance(sibling, str):
+                next_text += sibling
+            elif hasattr(sibling, "get_text"):
+                next_text += sibling.get_text()
+            if "Dean's List" in next_text or "Semester Honors" in next_text:
+                break
+            sibling = sibling.next_sibling if sibling else None
+
+        if "Dean's List & Semester Honors" in next_text:
+            award = "Dean's List & Semester Honors"
+        elif "Dean's List" in next_text:
+            award = "Dean's List"
+        elif "Semester Honors" in next_text:
+            award = "Semester Honors"
+        else:
+            continue
+
+        dedup_key = f"{first_name.lower()}|{last_name.lower()}"
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
+        records.append(
+            StudentRecord(
+                full_name=full_name,
+                first_name=first_name,
+                last_name=last_name,
+                semester=semester_label,
+                award=award,
+            )
+        )
+
+        if max_names and len(records) >= max_names:
+            break
+
+    return records
+
+
+@provider("business")
+def fetch_business_names(
+    semesters: list[str],
+    max_names: Optional[int] = None,
+    session: Optional[requests.Session] = None,
+) -> dict[str, list[StudentRecord]]:
+    """
+    Scrape Business school Dean's List pages for the requested semesters.
+    Returns dict mapping semester label -> list[StudentRecord].
+    """
+    sess = session or requests.Session()
+
+    requested_labels = {SEMESTER_LABELS[s] for s in semesters if s in SEMESTER_LABELS}
+    if not requested_labels:
+        print("[business] No valid semester codes provided.")
+        return {}
+
+    available = set(BUSINESS_SEMESTER_URLS)
+    per_semester: dict[str, list[StudentRecord]] = {}
+
+    for label in sorted(requested_labels):
+        if label not in available:
+            print(
+                f"[business] {label}: no data available. "
+                f"Supported: {', '.join(sorted(available))}"
+            )
+            continue
+
+        url = BUSINESS_SEMESTER_URLS[label]
+        print(f"[business] Fetching {label} from {url} …")
+
+        try:
+            resp = sess.get(url, timeout=60)
+            resp.raise_for_status()
+        except Exception as exc:
+            print(f"[business] Error fetching {label}: {exc}")
+            continue
+
+        records = _parse_business_page(resp.text, label, max_names=max_names)
+        if not records:
+            print(f"[business]   {label}: 0 names found (page may not exist or format changed).")
+        else:
+            per_semester[label] = records
+            print(f"[business]   {label}: {len(records)} unique names")
+
+    return per_semester
