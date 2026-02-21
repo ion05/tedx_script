@@ -380,7 +380,7 @@ def main() -> None:
     parser.add_argument(
         "--college",
         default=DEFAULT_COLLEGE,
-        choices=["science", "engineering", "polytechnic", "cla", "agriculture", "business"],
+        choices=["science", "engineering", "polytechnic", "cla", "agriculture", "business", "education"],
         help="Which college to scrape (default: %(default)s).",
     )
     parser.add_argument(

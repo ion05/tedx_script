@@ -2,7 +2,7 @@
 
 Scrapes student names from Purdue college honors / Dean's List pages, looks up each name in the Purdue Directory to find their alias, and writes results to one CSV per semester.
 
-Currently supports **College of Science**, **College of Engineering**, **Polytechnic**, **College of Liberal Arts (CLA)**, **College of Agriculture**, and **Mitch Daniels School of Business**. Adding more colleges is straightforward — just add a new provider function in `name_sources.py`.
+Currently supports **College of Science**, **College of Engineering**, **Polytechnic**, **College of Liberal Arts (CLA)**, **College of Agriculture**, **Mitch Daniels School of Business**, and **College of Education**. Adding more colleges is straightforward — just add a new provider function in `name_sources.py`.
 
 ## Setup
 
@@ -35,6 +35,10 @@ python scraper.py --college agriculture \
 
 # Business — Fall 2025 through Fall 2022
 python scraper.py --college business \
+    --semester 202610 202520 202510 202420 202410 202320 202310
+
+# Education — Fall 2025 through Fall 2022
+python scraper.py --college education \
     --semester 202610 202520 202510 202420 202410 202320 202310
 
 # Specific semester(s)
@@ -74,6 +78,7 @@ Each semester gets its own CSV. The output location depends on the college:
 | cla         | `output/cla/`            |
 | agriculture | `output/agriculture/`    |
 | business    | `output/business/`       |
+| education   | `output/education/`      |
 
 Files are named `{college}_emails_{semester}.csv`.  
 For example: `engineering_emails_fall_2025.csv`, `science_emails_spring_2023.csv`.

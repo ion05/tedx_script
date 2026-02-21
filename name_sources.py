@@ -743,6 +743,96 @@ def fetch_agriculture_names(
 
 
 # ---------------------------------------------------------------------------
+# Education provider
+# ---------------------------------------------------------------------------
+
+# The College of Education uses the same shared Purdue certificate backend
+# as the College of Science (server_processing.php).  The endpoint is
+# hosted on the Science domain and returns results for all colleges; we
+# filter to the requested semesters the same way the Science provider does.
+EDUCATION_API_URL = (
+    "https://www.science.purdue.edu/php-scripts/certificate/server_processing.php"
+)
+
+
+@provider("education")
+def fetch_education_names(
+    semesters: list[str],
+    max_names: Optional[int] = None,
+    session: Optional[requests.Session] = None,
+) -> dict[str, list[StudentRecord]]:
+    """
+    Fetch Dean's List / Semester Honors records for the requested semesters
+    from the shared Purdue certificate backend and return them grouped by
+    semester label.
+    """
+    sess = session or requests.Session()
+    semester_labels = {SEMESTER_LABELS[s] for s in semesters if s in SEMESTER_LABELS}
+    labels_display = ", ".join(sorted(semester_labels)) or "all"
+
+    print(f"[education] Fetching all records from honors API …")
+
+    params = {"draw": 1, "start": 0, "length": FETCH_ALL_LENGTH}
+    try:
+        resp = sess.get(EDUCATION_API_URL, params=params, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        print(f"[education] Error fetching data: {exc}")
+        return {}
+
+    all_rows = data.get("data", [])
+    total = data.get("recordsTotal", "?")
+    print(f"[education] Received {len(all_rows)} rows (server total: {total}).")
+    print(f"[education] Filtering for semesters: {labels_display} …")
+
+    per_semester: dict[str, list[StudentRecord]] = {label: [] for label in semester_labels}
+    seen_per_semester: dict[str, set[str]] = {label: set() for label in semester_labels}
+
+    for row in all_rows:
+        row_semester = row.get("1", "")
+        if row_semester not in semester_labels:
+            continue
+
+        full_name = row.get("0", "").strip()
+        first_name = row.get("4", "").strip()
+        last_name = row.get("5", "").strip()
+        award = row.get("2", "").strip()
+
+        if not full_name or not first_name or not last_name:
+            continue
+
+        dedup_key = f"{first_name.lower()}|{last_name.lower()}"
+        if dedup_key in seen_per_semester[row_semester]:
+            continue
+        seen_per_semester[row_semester].add(dedup_key)
+
+        per_semester[row_semester].append(
+            StudentRecord(
+                full_name=full_name,
+                first_name=first_name,
+                last_name=last_name,
+                semester=row_semester,
+                award=award,
+            )
+        )
+
+        if max_names:
+            all_full = all(len(v) >= max_names for v in per_semester.values())
+            if all_full:
+                break
+            if len(per_semester[row_semester]) >= max_names:
+                continue
+
+    for label, recs in per_semester.items():
+        if max_names:
+            per_semester[label] = recs[:max_names]
+        print(f"[education]   {label}: {len(per_semester[label])} unique names")
+
+    return per_semester
+
+
+# ---------------------------------------------------------------------------
 # Business provider
 # ---------------------------------------------------------------------------
 
